@@ -87,14 +87,17 @@ class TTScheduler(AsyncScheduler):
       strict queue, and every async op is forced to complete before the next
       prefill, so no later write can reach the KV they were computed against.
       The base class appends them on arrival and the resumed prefill replays
-      them. ``Request.async_tokens_to_discard`` serves the wholesale
-      ``reset_prefix_cache`` teardown only; wiring ordinary preemption into it
-      drops valid tokens and silently truncates the response.
-      A preempted request with an outstanding output placeholder stays in the
-      waiting queue until that valid frame is accounted for. Resuming earlier
-      would replay and sample against the old token history, producing a second
-      physical frame for the same single placeholder and advancing seeded RNG
-      state for a token that must be discarded.
+      them. Preemption moves the in-flight count into
+      ``Request.num_stale_output_tokens`` and zeroes
+      ``num_output_placeholders``; ``Request.drop_stale_output`` decides the
+      fate of those frames, and only the wholesale ``reset_prefix_cache``
+      teardown sets it. Wiring ordinary preemption into the drop path loses
+      valid tokens and silently truncates the response.
+      A preempted request whose stale frames are still deliverable stays in
+      the waiting queue until they arrive. Resuming earlier would replay and
+      sample against the old token history, producing a second physical frame
+      for the same single placeholder and advancing seeded RNG state for a
+      token that must be discarded.
 
     Supports ``set_forced_mode`` for lane coordination:
     - ``TTSchedulingMode.DECODE_ONLY`` forces decode-only (even if waiting
@@ -540,11 +543,13 @@ class TTScheduler(AsyncScheduler):
                 logger.error("%s", message)
                 return False
             raise RuntimeError(message)
-        # AsyncScheduler turns every outstanding placeholder into one discard
-        # when it preempts all running requests. Preserve that scheduler-owned
-        # boundary for the runner: the stale frames must still be published so
-        # AsyncScheduler consumes its counters, but must not be appended to the
-        # runner's cached request state before resumed-prefill inputs are built.
+        # Preempting a running request moves its outstanding placeholders into
+        # ``num_stale_output_tokens`` and, on this teardown path, sets
+        # ``drop_stale_output``. Preserve that scheduler-owned boundary for the
+        # runner: the stale frames must still be published so the base
+        # scheduler drains its counters in lockstep, but must not be appended
+        # to the runner's cached request state before resumed-prefill inputs
+        # are built.
         reset_candidates = (
             [
                 (request, request.num_output_placeholders)
@@ -560,9 +565,9 @@ class TTScheduler(AsyncScheduler):
             for request, placeholder_count in reset_candidates:
                 if (
                     request.status == RequestStatus.PREEMPTED
-                    and request.async_tokens_to_discard > 0
+                    and request.num_stale_output_tokens > 0
                 ):
-                    count = min(placeholder_count, request.async_tokens_to_discard)
+                    count = min(placeholder_count, request.num_stale_output_tokens)
                     pending = self._pending_forced_reset_discard_counts
                     pending[request.request_id] = (
                         pending.get(request.request_id, 0) + count
@@ -587,12 +592,16 @@ class TTScheduler(AsyncScheduler):
                 request.num_output_placeholders += extra_placeholders
 
     def _update_request_with_output(
-        self, request: Request, new_token_ids: list[int]
+        self, request: Request, new_token_ids: list[int], is_stale: bool = False
     ) -> tuple[list[int], bool]:
         """Commit one block and reconcile its full physical reservation."""
         if not self._is_block_output_model:
-            return super()._update_request_with_output(request, new_token_ids)
-        if request.async_tokens_to_discard:
+            # AsyncScheduler guards its placeholder decrement with
+            # ``if not is_stale``; dropping the flag here would underflow it.
+            return super()._update_request_with_output(
+                request, new_token_ids, is_stale=is_stale
+            )
+        if is_stale:
             raise RuntimeError(
                 "A stale async output reached synchronous block serving; "
                 "block-output async scheduling and running prefix resets are "
