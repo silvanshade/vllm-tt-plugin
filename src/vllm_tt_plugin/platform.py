@@ -60,6 +60,12 @@ TT_LANE_SCHEDULER_CLS = "vllm_tt_plugin.lane_scheduler.TTLaneCoordinator"
 # (_aligned_prefill_len and _round_down_to_tile), so admission and the adapter
 # must agree on this hardware-fixed value.
 _TT_TOKEN_TILE_SIZE = 32
+# KV page width the TT model trees are built for. Every ``models/demos`` tree
+# pages at 64 (``qwen36_vllm._BLOCK_SIZE``, the Gemma4 and Qwen3.6 demos and
+# tests), the Qwen3.6 chunked prefill hardcodes it (``model.py`` page-table
+# slicing), and ``docs/diffusion-gemma.md`` already tells operators to pass it;
+# ``tt_transformers`` reads the width from the cache and accepts any value.
+_TT_DEFAULT_KV_BLOCK_SIZE = 64
 _DIFFUSION_GEMMA_TT_ARCHITECTURES = {
     "DiffusionGemmaForBlockDiffusion": "TTDiffusionGemmaForBlockDiffusion",
     "DiffusionGemmaForCausalLM": "TTDiffusionGemmaForCausalLM",
@@ -230,8 +236,7 @@ def _renormalize_mamba_cache_config(vllm_config: "VllmConfig") -> None:
     branch core takes when prefix caching is off: that validator reads
     ``mamba_block_size == max_model_len`` as "unset".
 
-    ``block_size`` is deliberately left alone. TT reads it when it builds the KV
-    spec, and it already holds the value core's disabled branch computes.
+    ``block_size`` is settled later by ``TTPlatform.update_block_size_for_backend``.
     """
     cache_config = vllm_config.cache_config
     if getattr(cache_config, "mamba_block_size", None) is None:
@@ -1368,6 +1373,26 @@ class TTPlatform(Platform):
         return (
             get_tt_output_tokens_per_step(vllm_config),
             int(vllm_config.model_config.max_model_len),
+        )
+
+    @classmethod
+    def update_block_size_for_backend(cls, vllm_config: "VllmConfig") -> None:
+        """Page the KV cache at the width the TT model trees are built for.
+
+        Core picks ``block_size`` from the attention backend's preference and
+        returns before that when the platform has no backend, so TT kept core's
+        16-token default. The Qwen3.6 tree slices its page table at 64 on the
+        chunked prefill path whatever the cache holds, so a 16-token pool
+        wedges the device on the first prompt above one chunk, with no error.
+        ``--block-size`` still wins when the operator sets it.
+        """
+        cache_config = vllm_config.cache_config
+        if cache_config.user_specified_block_size:
+            return
+        cache_config.block_size = _TT_DEFAULT_KV_BLOCK_SIZE
+        logger.info(
+            "Setting kv cache block size to %d for the TT backend.",
+            _TT_DEFAULT_KV_BLOCK_SIZE,
         )
 
     @classmethod
