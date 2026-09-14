@@ -53,10 +53,12 @@ def install_paged_fill_cache_cast() -> None:
 
     The identity branch therefore compiles the cast itself, once per fill
     shape, whenever the cache is narrower than the bfloat16 the model fills
-    with at request time. The probe is cloned from the warmup fill rather than
-    built from host memory, so it inherits that tensor's placement and layout
-    and keys the same program the request will need. Callers that already
-    match at bfloat16 never enter this path.
+    with at request time. The probe is cloned from the warmup fill, at that
+    fill's own memory config, so it keys a program on the same shape, layout
+    and placement the request will present -- which holds exactly as far as
+    the warmup fill matches the request K/V, the premise the model's own fill
+    warmup already stands on. Callers that match at bfloat16 never enter this
+    path.
     """
     global _FILL_CAST_INSTALLED
     if _FILL_CAST_INSTALLED:
@@ -81,7 +83,7 @@ def install_paged_fill_cache_cast() -> None:
         if cache.dtype is not ttnn.bfloat16 and shape not in warmed:
             warmed.add(shape)
             probe = ttnn.clone(
-                fill, dtype=ttnn.bfloat16, memory_config=ttnn.L1_MEMORY_CONFIG
+                fill, dtype=ttnn.bfloat16, memory_config=fill.memory_config()
             )
             try:
                 cast = ttnn.clone(
@@ -162,17 +164,27 @@ def weight_downcast(dtype_name: str, min_elements: int = 1 << 20):
         counts["downcast"] += 1
         return {**kwargs, "dtype": target}
 
+    # as_tensor resolves from_torch through the module attribute at call time,
+    # so the inner call lands on the wrapper too. Both entry points need
+    # wrapping -- a model calls from_torch directly as well -- so the outer
+    # call claims the conversion and the inner one passes the already-decided
+    # dtype through, leaving one decision and one audit entry per tensor.
+    depth = 0
+
     def wrap(fn):
         @functools.wraps(fn)
         def wrapped(tensor, *args, **kwargs):
-            return fn(tensor, *args, **rewrite(tensor, kwargs))
+            nonlocal depth
+            if depth:
+                return fn(tensor, *args, **kwargs)
+            depth += 1
+            try:
+                return fn(tensor, *args, **rewrite(tensor, kwargs))
+            finally:
+                depth -= 1
 
         return wrapped
 
-    # as_tensor reaches from_torch through the module attribute, so wrapping
-    # both would count and rewrite one uncached conversion twice. The inner
-    # function keeps its original binding; only the outer one is replaced for
-    # the cached path.
     ttnn.as_tensor = wrap(as_tensor)
     ttnn.from_torch = wrap(from_torch)
     _WEIGHT_DOWNCAST_DTYPE = dtype_name
