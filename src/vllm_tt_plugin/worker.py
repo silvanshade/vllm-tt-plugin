@@ -20,6 +20,7 @@ from vllm.v1.core.kv_cache_utils import (
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
+    KVCacheLayout,
     KVCacheSpec,
     MLAAttentionSpec,
     UniformTypeKVCacheSpecs,
@@ -392,6 +393,24 @@ class TTWorker(WorkerBase):
                 sliding_window=sliding_window,
             )
         return {"foo": attn_spec}
+
+    def get_supported_kv_cache_layouts(self) -> list[str]:
+        """Every layout, in vLLM's declaration order.
+
+        vLLM 0.29 resolves one physical KV cache layout per model before memory
+        profiling, and asks each worker which layouts its attention backends
+        support. The base implementation answers by enumerating the model's
+        vLLM attention layers, and falls back to asking the platform for a
+        backend class when it finds none. TT has neither: the device model owns
+        its cache, registers no ``AttentionLayerBase`` layer, and the platform
+        has no attention backend to name, so the fallback raises.
+
+        Nothing in the TT path reads the resolved layout, so the honest answer
+        is that no layout is excluded. Returning the full enum lets the engine
+        core resolve its own default while keeping a real intersection for any
+        future backend that does constrain the choice.
+        """
+        return [layout.name for layout in KVCacheLayout]
 
     def determine_available_memory(self) -> int:
         """
