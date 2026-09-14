@@ -716,7 +716,9 @@ def _pause_guarded_engine(scheduler: TTScheduler) -> SimpleNamespace:
     from vllm_tt_plugin.platform import _install_block_output_pause_guard_patch
 
     _install_block_output_pause_guard_patch()
-    return SimpleNamespace(scheduler=scheduler)
+    # vLLM 0.29's pause path calls back into the engine once the scheduler
+    # reports idle; the fake only has to accept the call.
+    return SimpleNamespace(scheduler=scheduler, _finish_pause=lambda clear_cache: None)
 
 
 def test_keep_pause_with_clear_cache_is_refused_up_front():
@@ -778,7 +780,7 @@ def test_deferred_keep_reset_returns_false_without_preempting_block_request():
     )
     assert scheduler.running == [request]
     assert request.status == RequestStatus.RUNNING
-    assert request.async_tokens_to_discard == 0
+    assert request.num_stale_output_tokens == 0
 
 
 def test_ar_prefix_cache_reset_delegates_to_upstream_preemption():
@@ -790,7 +792,11 @@ def test_ar_prefix_cache_reset_delegates_to_upstream_preemption():
     )
     assert scheduler.running == []
     assert request.status == RequestStatus.PREEMPTED
-    assert request.async_tokens_to_discard == 1
+    # The counter carries the whole in-flight step, which here is the prefill.
+    assert request.num_stale_output_tokens == len(request.prompt_token_ids)
+    # The teardown path preempts in drop mode, so the stale frame is discarded
+    # rather than delivered.
+    assert request.drop_stale_output is True
     assert request.num_output_placeholders == 0
 
 
@@ -799,7 +805,11 @@ def test_ordinary_async_preemption_keeps_inflight_token_for_resume():
     scheduler.running.remove(request)
     scheduler._preempt_request(request, time.monotonic())
 
-    assert request.num_output_placeholders == 1
+    # Preemption moves the in-flight count out of the placeholder counter and
+    # into the stale counter; ordinary preemption keeps the frame deliverable.
+    assert request.num_output_placeholders == 0
+    assert request.num_stale_output_tokens == len(request.prompt_token_ids)
+    assert request.drop_stale_output is False
     outputs = scheduler.update_from_output(submitted, _runner_output(submitted, [7]))
     assert outputs[0].outputs[0].new_token_ids == [7]
     assert list(request.output_token_ids) == [7]
@@ -817,7 +827,7 @@ def test_preempted_request_waits_for_inflight_output_before_resume():
     blocked = scheduler.schedule()
     assert blocked.total_num_scheduled_tokens == 0
     assert request.status == RequestStatus.PREEMPTED
-    assert request.num_output_placeholders == 1
+    assert request.num_stale_output_tokens == len(request.prompt_token_ids)
 
     older = scheduler.update_from_output(submitted, _runner_output(submitted, [7]))
     assert older[0].outputs[0].new_token_ids == [7]
@@ -842,7 +852,7 @@ def test_forced_reset_discards_stale_frame_before_following_valid_frame():
     assert get_tt_forced_reset_discard_counts(resumed) == {request.request_id: 1}
     stale = scheduler.update_from_output(submitted, _runner_output(submitted, [7]))
     assert stale[0].outputs == []
-    assert request.async_tokens_to_discard == 0
+    assert request.num_stale_output_tokens == 0
     assert list(request.output_token_ids) == []
 
     valid = scheduler.update_from_output(resumed, _runner_output(resumed, [8]))
@@ -855,7 +865,7 @@ def test_forced_reset_discards_stale_frame_before_following_valid_frame():
     ("mutate", "width", "exc", "match"),
     [
         pytest.param(
-            lambda r: setattr(r, "async_tokens_to_discard", 1),
+            lambda r: setattr(r, "num_stale_output_tokens", r.num_in_flight_tokens),
             CANVAS,
             RuntimeError,
             "stale async output",
