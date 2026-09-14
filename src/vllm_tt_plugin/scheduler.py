@@ -90,9 +90,10 @@ class TTScheduler(AsyncScheduler):
       them. Preemption moves the in-flight count into
       ``Request.num_stale_output_tokens`` and zeroes
       ``num_output_placeholders``; ``Request.drop_stale_output`` decides the
-      fate of those frames, and only the wholesale ``reset_prefix_cache``
-      teardown sets it. Wiring ordinary preemption into the drop path loses
-      valid tokens and silently truncates the response.
+      fate of those frames: the wholesale ``reset_prefix_cache`` teardown sets
+      it, as does a preemption under a KV connector that requires delivery.
+      Wiring ordinary preemption into the drop path loses valid tokens and
+      silently truncates the response.
       A preempted request whose stale frames are still deliverable stays in
       the waiting queue until they arrive. Resuming earlier would replay and
       sample against the old token history, producing a second physical frame

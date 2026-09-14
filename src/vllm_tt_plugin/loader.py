@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
-import atexit
+import contextlib
 import functools
 import math
 
@@ -43,6 +43,20 @@ def install_paged_fill_cache_cast() -> None:
 
     Identity when the dtypes already agree, so the default bfloat16 cache pays
     nothing, and installed once per process.
+
+    **Warmup.** A model warms its fill-width-keyed programs before parking a
+    prefill trace, because a program compiled after a trace is parked clobbers
+    it and the symptom is a hang, not an error. Warmup builds its fill tensor
+    at the *cache* dtype, so against a narrowed cache it takes the identity
+    branch and the cast never compiles -- then the first real request, whose
+    K/V are bfloat16, compiles it at exactly the wrong moment.
+
+    The identity branch therefore compiles the cast itself, once per fill
+    shape, whenever the cache is narrower than the bfloat16 the model fills
+    with at request time. The probe is cloned from the warmup fill rather than
+    built from host memory, so it inherits that tensor's placement and layout
+    and keys the same program the request will need. Callers that already
+    match at bfloat16 never enter this path.
     """
     global _FILL_CAST_INSTALLED
     if _FILL_CAST_INSTALLED:
@@ -51,17 +65,32 @@ def install_paged_fill_cache_cast() -> None:
     import ttnn
 
     original = ttnn.experimental.paged_fill_cache
+    warmed: set[tuple[int, ...]] = set()
 
     def paged_fill_cache(cache, fill, page_table, *args, **kwargs):
-        if fill.dtype == cache.dtype:
-            return original(cache, fill, page_table, *args, **kwargs)
-        cast = ttnn.clone(
-            fill, dtype=cache.dtype, memory_config=ttnn.DRAM_MEMORY_CONFIG
-        )
-        try:
-            return original(cache, cast, page_table, *args, **kwargs)
-        finally:
-            ttnn.deallocate(cast)
+        if fill.dtype != cache.dtype:
+            cast = ttnn.clone(
+                fill, dtype=cache.dtype, memory_config=ttnn.DRAM_MEMORY_CONFIG
+            )
+            try:
+                return original(cache, cast, page_table, *args, **kwargs)
+            finally:
+                ttnn.deallocate(cast)
+
+        shape = tuple(fill.shape)
+        if cache.dtype is not ttnn.bfloat16 and shape not in warmed:
+            warmed.add(shape)
+            probe = ttnn.clone(
+                fill, dtype=ttnn.bfloat16, memory_config=ttnn.L1_MEMORY_CONFIG
+            )
+            try:
+                cast = ttnn.clone(
+                    probe, dtype=cache.dtype, memory_config=ttnn.DRAM_MEMORY_CONFIG
+                )
+                ttnn.deallocate(cast)
+            finally:
+                ttnn.deallocate(probe)
+        return original(cache, fill, page_table, *args, **kwargs)
 
     ttnn.experimental.paged_fill_cache = paged_fill_cache
     _FILL_CAST_INSTALLED = True
@@ -78,10 +107,11 @@ def _resolve_dtype(name):
     return getattr(ttnn, name)
 
 
-_WEIGHT_DOWNCAST_INSTALLED = False
+_WEIGHT_DOWNCAST_DTYPE: str | None = None
 
 
-def install_weight_downcast(dtype_name: str, min_elements: int = 1 << 20) -> None:
+@contextlib.contextmanager
+def weight_downcast(dtype_name: str, min_elements: int = 1 << 20):
     """Store large 2-D weights at ``dtype_name`` instead of bfloat8_b.
 
     A model's weight dtype is chosen inside its own config, so the only seam a
@@ -95,19 +125,31 @@ def install_weight_downcast(dtype_name: str, min_elements: int = 1 << 20) -> Non
     chose to keep at bfloat16 pass through untouched, which is the split the
     4-bit bring-up validated.
 
-    The cache is keyed on the *requested* dtype, so a downcast run MUST have its
-    own ``TT_CACHE_PATH``: a cached tensor is reloaded verbatim and this hook
-    never sees it, so pointing a downcast run at a bfloat8_b cache silently
-    serves 8-bit weights while reporting a downcast.
+    A tensor cache keyed on the dtype that reaches ``as_tensor`` needs no
+    special handling: the rewrite happens before the key is built, so a
+    downcast run reads and writes its own entries and cannot pick up an
+    8-bit one.
+
+    Scoped to the conversion it exists for, and restored after. Weight loading
+    is not the only caller of these two functions -- a model builds device
+    tensors at run time too, and some of those are large enough to match the
+    predicate -- so leaving the rewrite installed would silently narrow tensors
+    that are not weights.
     """
-    global _WEIGHT_DOWNCAST_INSTALLED
-    if _WEIGHT_DOWNCAST_INSTALLED:
-        return
+    global _WEIGHT_DOWNCAST_DTYPE
+    if _WEIGHT_DOWNCAST_DTYPE is not None:
+        # Re-entry can only mean two models in one process wanting different
+        # weight dtypes, and the nesting would give the inner one both.
+        raise RuntimeError(
+            f"Weight downcast to {_WEIGHT_DOWNCAST_DTYPE} is already active; "
+            f"cannot nest a downcast to {dtype_name}"
+        )
 
     import ttnn
 
     target = _resolve_dtype(dtype_name)
     counts = {"downcast": 0, "kept": 0}
+    as_tensor, from_torch = ttnn.as_tensor, ttnn.from_torch
 
     def rewrite(tensor, kwargs):
         if kwargs.get("dtype") is not ttnn.bfloat8_b:
@@ -127,21 +169,28 @@ def install_weight_downcast(dtype_name: str, min_elements: int = 1 << 20) -> Non
 
         return wrapped
 
-    ttnn.as_tensor = wrap(ttnn.as_tensor)
-    ttnn.from_torch = wrap(ttnn.from_torch)
-    _WEIGHT_DOWNCAST_INSTALLED = True
+    # as_tensor reaches from_torch through the module attribute, so wrapping
+    # both would count and rewrite one uncached conversion twice. The inner
+    # function keeps its original binding; only the outer one is replaced for
+    # the cached path.
+    ttnn.as_tensor = wrap(as_tensor)
+    ttnn.from_torch = wrap(from_torch)
+    _WEIGHT_DOWNCAST_DTYPE = dtype_name
     logger.info(
-        "TT weight downcast installed: bfloat8_b -> %s for 2-D weights >= %d elements",
+        "TT weight downcast active: bfloat8_b -> %s for 2-D weights >= %d elements",
         dtype_name,
         min_elements,
     )
-    atexit.register(
-        lambda: logger.info(
-            "TT weight downcast: %d downcast, %d kept",
+    try:
+        yield
+    finally:
+        ttnn.as_tensor, ttnn.from_torch = as_tensor, from_torch
+        _WEIGHT_DOWNCAST_DTYPE = None
+        logger.info(
+            "TT weight downcast complete: %d downcast, %d kept",
             counts["downcast"],
             counts["kept"],
         )
-    )
 
 
 def override_kv_cache_dtype(model, dtype_name: str):
@@ -164,6 +213,14 @@ def override_kv_cache_dtype(model, dtype_name: str):
         raise TypeError(
             f"Cannot set KV cache dtype on {type(model).__name__}: "
             "expected a .model list whose entries expose allocate_kv_caches"
+        )
+    if hasattr(model, "allocate_kv_cache_per_layer"):
+        # The runner prefers the per-layer entry point where a model has one,
+        # and would then never reach the substitution below -- reporting the
+        # override while serving the model's own dtype.
+        raise TypeError(
+            f"{type(model).__name__} exposes allocate_kv_cache_per_layer, "
+            "which this substitution does not cover"
         )
 
     def allocate_kv_cache(kv_cache_shape, _dtype, num_layers):
@@ -197,23 +254,24 @@ class TTModelLoader(BaseModelLoader):
         tt_data_parallel = get_tt_data_parallel_size(vllm_config)
         max_batch_size = get_tt_max_batch_size(vllm_config)
 
-        # Both before the model is built: the downcast has to be in place for
-        # the weight conversions the constructor performs, and a model that
-        # allocates its cache at load time needs a fill leg that can write
-        # into a narrower cache.
+        # The fill cast stays for the process: it is on the request path, not
+        # just the load path. The downcast is scoped to the conversions the
+        # constructor performs.
         install_paged_fill_cache_cast()
         weight_dtype = tt_config.get("weight_dtype", None)
-        if weight_dtype is not None:
-            install_weight_downcast(weight_dtype)
-
-        model = model_class.initialize_vllm_model(
-            model_config.hf_config,
-            device_config.device,
-            max_batch_size,
-            max_seq_len=model_config.max_model_len,
-            tt_data_parallel=tt_data_parallel,
-            optimizations=optimizations,
-        )
+        with (
+            weight_downcast(weight_dtype)
+            if weight_dtype is not None
+            else contextlib.nullcontext()
+        ):
+            model = model_class.initialize_vllm_model(
+                model_config.hf_config,
+                device_config.device,
+                max_batch_size,
+                max_seq_len=model_config.max_model_len,
+                tt_data_parallel=tt_data_parallel,
+                optimizations=optimizations,
+            )
 
         kv_cache_dtype = tt_config.get("kv_cache_dtype", None)
         if kv_cache_dtype is not None:
