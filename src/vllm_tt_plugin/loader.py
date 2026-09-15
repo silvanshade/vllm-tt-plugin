@@ -327,6 +327,12 @@ class TTModelLoader(BaseModelLoader):
 
         tt_data_parallel = get_tt_data_parallel_size(vllm_config)
         max_batch_size = get_tt_max_batch_size(vllm_config)
+        speculative_config = vllm_config.speculative_config
+        speculative_kwargs = (
+            {"num_speculative_tokens": speculative_config.num_speculative_tokens}
+            if speculative_config is not None
+            else {}
+        )
 
         # The fill cast stays for the process: it is on the request path, not
         # just the load path. The downcast is scoped to the conversions the
@@ -345,6 +351,7 @@ class TTModelLoader(BaseModelLoader):
                 max_seq_len=model_config.max_model_len,
                 tt_data_parallel=tt_data_parallel,
                 optimizations=optimizations,
+                **speculative_kwargs,
             )
 
         kv_cache_dtype = tt_config.get("kv_cache_dtype", None)
