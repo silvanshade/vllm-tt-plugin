@@ -28,8 +28,10 @@ from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.structured_output import install_tt_compact_json_patch
 from vllm_tt_plugin.utils.dp_discovery import (
     StandardDPAssignmentT,
+    resolve_single_device_dp_assignments,
     run_standard_dp_visible_device_group_discovery,
     split_standard_dp_discovery_result,
+    standard_dp_rank_environments,
 )
 
 # These stay behind TYPE_CHECKING deliberately. ``vllm.config`` imports
@@ -50,6 +52,7 @@ _STANDARD_DP_DISCOVERY_RECV_TIMEOUT_S = 60.0
 _STANDARD_DP_DISCOVERY_JOIN_TIMEOUT_S = 5.0
 _STANDARD_DP_MESH_GRIDS_KEY = "_tt_standard_dp_mesh_grids"
 _STANDARD_DP_VISIBLE_GROUPS_KEY = "_tt_standard_dp_visible_groups"
+_STANDARD_DP_RUNTIME_ENVS_KEY = "_tt_standard_dp_runtime_envs"
 
 TT_SCHEDULER_CLS = "vllm_tt_plugin.scheduler.TTScheduler"
 TT_LANE_SCHEDULER_CLS = "vllm_tt_plugin.lane_scheduler.TTLaneCoordinator"
@@ -388,6 +391,20 @@ def _resolve_standard_dp_visible_device_groups(
     [("0,1,2,3", (1, 4)), ...]
     """
     parallel_config = vllm_config.parallel_config
+    tt_config = get_tt_config(vllm_config)
+    if "dp_device_ids" in tt_config:
+        if _uses_explicit_tt_mpi_launch(vllm_config):
+            raise ValueError("tt.dp_device_ids requires single-host standard DP")
+        assignments = resolve_single_device_dp_assignments(
+            tt_config["dp_device_ids"],
+            parallel_config.data_parallel_size,
+            os.environ.get("TT_VISIBLE_DEVICES"),
+        )
+        vllm_config.additional_config[_STANDARD_DP_RUNTIME_ENVS_KEY] = (
+            standard_dp_rank_environments(len(assignments), os.environ)
+        )
+        return assignments
+
     if parallel_config.data_parallel_size <= 1 or _uses_explicit_tt_mpi_launch(
         vllm_config
     ):
@@ -1846,6 +1863,10 @@ class TTPlatform(Platform):
         _convert_dp_to_lanes(vllm_config, model_class)
 
         is_lane_mode = uses_tt_lane_coordinator(vllm_config)
+        if is_lane_mode and "dp_device_ids" in tt_config:
+            raise ValueError(
+                "tt.dp_device_ids is not supported with in-process TT lanes"
+            )
         if (
             getattr(model_config, "is_moe", False)
             and parallel_config.data_parallel_size > 1

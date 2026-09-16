@@ -423,9 +423,27 @@ prefill or decode, executes a local TT batch, and updates only its own request
 state. From the scheduling perspective, this is equivalent to running `N`
 independent TT servers behind vLLM's DP request routing.
 
-On a single host, the plugin discovers TT device groups at startup and assigns
-one group to each rank through `TT_VISIBLE_DEVICES`. Request routing binds each
-request to one rank; requests do not migrate between ranks.
+On a single host, the plugin discovers TT device groups at startup and assigns one group to each rank through `TT_VISIBLE_DEVICES`. Request routing binds each request to one rank; requests do not migrate between ranks.
+
+For independent single-device replicas, set `tt.dp_device_ids` to physical PCIe device IDs in local-rank order. This bypasses connected-parent discovery: each worker opens its own 1x1 mesh, so the cards need no interconnect for this placement.
+
+```bash
+vllm serve MODEL --data-parallel-size 2 \
+  --additional-config '{"tt":{"dp_device_ids":[0,1]}}'
+```
+
+The list must contain one distinct, non-negative integer per rank. IDs refer to physical cards, not positions in `TT_VISIBLE_DEVICES`; an inherited visibility restriction must include every requested ID. Device availability is checked when each worker opens its mesh. Explicit singleton placement supports single-host standard DP, not MPI, multi-host placement, lane-DP or MoE. Without this option, connected-mesh discovery is unchanged.
+
+Each explicitly placed worker gets isolated runtime state before opening its device:
+
+| Setting | Rank-local value |
+| --- | --- |
+| `TT_METAL_LOGS_PATH` | `<configured-root>/dp_rank_N`; root defaults to the launch directory |
+| `TT_METAL_INSPECTOR_RPC_SERVER_ADDRESS` | Configured host and base port plus `N`; default base is `localhost:50051`, and port zero retains ephemeral allocation |
+| `TT_CACHE_PATH` | `<configured-root>/dp_rank_N`, when explicitly set |
+| `TT_METAL_CACHE` | `<configured-root>/dp_rank_N`, when explicitly set |
+
+Reserve the Inspector port range for this service. Configure cache roots when using writable caches; unset cache variables retain the model/runtime defaults. Prepare each rank's weight cache under its resulting path, or budget for independent conversion. Cold loading and kernel compilation can overlap across workers; device memory is not a host-memory budget. Timeout diagnostic commands inherit each worker's paths and RPC address and must use them.
 
 For standard DP, `--max_num_seqs M` is the capacity of each rank. The plugin
 does not multiply the rank-local model or KV-cache capacity by the number of

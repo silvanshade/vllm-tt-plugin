@@ -6,6 +6,8 @@
 __all__ = (
     "format_tt_visible_devices",
     "parse_mesh_grid",
+    "resolve_single_device_dp_assignments",
+    "standard_dp_rank_environments",
     "run_standard_dp_visible_device_group_discovery",
     "split_standard_dp_discovery_result",
     "StandardDPAssignmentT",
@@ -13,8 +15,10 @@ __all__ = (
 
 import ast
 import logging
-from collections.abc import Sequence
+import os
+from collections.abc import Mapping, Sequence
 from contextlib import suppress
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +37,89 @@ _MESH_GRID_PRESETS = {
     "P150x8": (1, 8),
     "P300x2": (1, 4),
 }
+
+
+def resolve_single_device_dp_assignments(
+    device_ids: object,
+    data_parallel_size: int,
+    visible_devices: str | None,
+) -> list[StandardDPAssignmentT]:
+    """Resolve explicit physical PCIe IDs without opening a connected mesh.
+
+    # Specification
+    - provides: one 1x1 assignment per rank, in the requested physical-ID order.
+    - fails: ValueError for non-integer/negative/duplicate IDs, a rank-count
+      mismatch, or IDs outside an inherited visibility restriction.
+    - intension: performs no device enumeration or runtime initialization.
+    """
+    if (
+        not isinstance(device_ids, list)
+        or not device_ids
+        or len(device_ids) != data_parallel_size
+        or any(type(device_id) is not int or device_id < 0 for device_id in device_ids)
+    ):
+        raise ValueError(
+            "tt.dp_device_ids must contain one non-negative integer physical "
+            f"PCIe ID per DP rank; got {device_ids!r} for DP={data_parallel_size}"
+        )
+    if len(set(device_ids)) != len(device_ids):
+        raise ValueError(f"tt.dp_device_ids must not share devices: {device_ids!r}")
+    if visible_devices is not None:
+        try:
+            allowed = {int(part.strip()) for part in visible_devices.split(",")}
+        except ValueError as exc:
+            raise ValueError(
+                "TT_VISIBLE_DEVICES must contain physical PCIe IDs: "
+                f"{visible_devices!r}"
+            ) from exc
+        if not set(device_ids).issubset(allowed):
+            raise ValueError(
+                f"tt.dp_device_ids={device_ids!r} exceeds inherited "
+                f"TT_VISIBLE_DEVICES={visible_devices!r}"
+            )
+    return [(str(device_id), (1, 1)) for device_id in device_ids]
+
+
+def standard_dp_rank_environments(
+    num_ranks: int, environ: Mapping[str, str]
+) -> list[dict[str, str]]:
+    """Snapshot rank-local runtime namespaces before workers narrow their env.
+
+    # Specification
+    - requires: num_ranks is positive.
+    - provides: distinct rank-local log roots and consecutive Inspector ports;
+      port zero retains the runtime's ephemeral-port selection.
+    - provides: rank subdirectories for explicitly configured TT_CACHE_PATH and
+      TT_METAL_CACHE, keeping concurrent cache writers independent.
+    - fails: ValueError when the Inspector host/port or rank-offset range is invalid.
+    - intension: does not create directories, bind sockets or initialize devices.
+    """
+    rpc_address_env = "TT_METAL_INSPECTOR_RPC_SERVER_ADDRESS"
+    address = environ.get(rpc_address_env, "localhost:50051")
+    host, separator, port_text = address.partition(":")
+    try:
+        port = int(port_text) if separator else 50051
+    except ValueError as exc:
+        raise ValueError(f"Invalid Inspector host[:port]: {address!r}") from exc
+    if not host or port < 0 or (port and port + num_ranks - 1 > 65535):
+        raise ValueError(
+            f"Inspector address {address!r} cannot provide ports for "
+            f"{num_ranks} DP ranks"
+        )
+    log_root = Path(environ.get("TT_METAL_LOGS_PATH") or os.getcwd())
+    cache_roots = {
+        key: Path(environ[key])
+        for key in ("TT_CACHE_PATH", "TT_METAL_CACHE")
+        if environ.get(key)
+    }
+    return [
+        {
+            "TT_METAL_LOGS_PATH": str(log_root / f"dp_rank_{rank}"),
+            rpc_address_env: f"{host}:{port + rank if port else 0}",
+            **{key: str(root / f"dp_rank_{rank}") for key, root in cache_roots.items()},
+        }
+        for rank in range(num_ranks)
+    ]
 
 
 def parse_mesh_grid(

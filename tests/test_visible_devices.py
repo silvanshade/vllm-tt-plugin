@@ -8,11 +8,16 @@ mesh grid they resolve to, the handoff to ``assigned_physical_gpu_ids``, and
 the per-rank env binding the worker applies.
 """
 
+import copy
 import os
+import pickle
+from dataclasses import asdict
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import ttnn
+from vllm.config.structured_outputs import StructuredOutputsConfig
 from vllm.v1.engine import utils as engine_utils
 
 from vllm_tt_plugin import platform as tt_platform
@@ -55,12 +60,100 @@ def _discovered_groups_config(
     )
 
 
-def test_standard_dp_discovery_target_uses_helper_module() -> None:
-    """Keep the spawned discovery target outside the platform module."""
-    assert (
-        tt_platform.run_standard_dp_visible_device_group_discovery.__module__
-        == "vllm_tt_plugin.utils.dp_discovery"
+def test_explicit_singletons_reach_workers_without_parent_mesh(
+    monkeypatch: pytest.MonkeyPatch,
+    vllm_config: SimpleNamespace,
+    tmp_path: Path,
+) -> None:
+    """Sparse physical IDs survive spawn and independent-DP reconfiguration."""
+    monkeypatch.setenv(EVAR, "3,7,11")
+    monkeypatch.setenv("TT_METAL_LOGS_PATH", str(tmp_path))
+    monkeypatch.setenv("TT_METAL_INSPECTOR_RPC_SERVER_ADDRESS", "127.0.0.1:50051")
+    monkeypatch.setenv("TT_CACHE_PATH", str(tmp_path / "weights"))
+    monkeypatch.setenv("TT_METAL_CACHE", str(tmp_path / "kernels"))
+    monkeypatch.setattr(engine_utils, "current_platform", TTPlatform)
+    monkeypatch.setattr(tt_platform, "register_tt_models", lambda *_args: None)
+    monkeypatch.setattr(
+        "vllm.model_executor.models.registry.ModelRegistry.get_supported_archs",
+        lambda: ["TTDummyModel"],
     )
+    monkeypatch.setattr(
+        "vllm.model_executor.model_loader.utils.get_model_architecture",
+        lambda _config: (type("DummyModel", (), {}), None),
+    )
+
+    def reject_parent_discovery(_method: str) -> None:
+        raise AssertionError("independent cards must not open a parent mesh")
+
+    monkeypatch.setattr(
+        tt_platform.multiprocessing, "get_context", reject_parent_discovery
+    )
+    vllm_config.parallel_config.data_parallel_size = 2
+    vllm_config.additional_config = {"tt": {"dp_device_ids": [7, 3]}}
+    vllm_config.structured_outputs_config = StructuredOutputsConfig(backend="auto")
+    TTPlatform.check_and_update_config(vllm_config)
+    # API workers reconstruct this dataclass after the platform hook.
+    assert StructuredOutputsConfig(
+        **asdict(vllm_config.structured_outputs_config)
+    ) == StructuredOutputsConfig(backend="auto")
+    payload = pickle.dumps(vllm_config.additional_config)
+    for rank, physical_id in enumerate(("7", "3")):
+        child = copy.deepcopy(vllm_config)
+        child.additional_config = pickle.loads(payload)
+        engine_utils.set_assigned_physical_gpu_ids_for_dp_rank(child, rank)
+        child.parallel_config.data_parallel_rank_local = rank
+        # Upstream collapses dense DP before initializing the worker.
+        child.parallel_config.data_parallel_size = 1
+        _bind_visible_devices_env(child)
+        TTPlatform.check_and_update_config(child)
+        assert os.environ[EVAR] == physical_id
+        assert _resolve_mesh_grid("P150", 1, physical_id) == (1, 1)
+        assert os.environ["TT_METAL_LOGS_PATH"] == str(tmp_path / f"dp_rank_{rank}")
+        assert os.environ["TT_METAL_INSPECTOR_RPC_SERVER_ADDRESS"] == (
+            f"127.0.0.1:{50051 + rank}"
+        )
+        assert os.environ["TT_CACHE_PATH"] == str(
+            tmp_path / "weights" / f"dp_rank_{rank}"
+        )
+        assert os.environ["TT_METAL_CACHE"] == str(
+            tmp_path / "kernels" / f"dp_rank_{rank}"
+        )
+
+
+@pytest.mark.parametrize("device_ids", [None, [True, 3], [-1, 3], [7], [3, 3], [7, 12]])
+def test_explicit_singletons_reject_ambiguous_or_unavailable_assignments(
+    monkeypatch: pytest.MonkeyPatch,
+    vllm_config: SimpleNamespace,
+    device_ids: object,
+) -> None:
+    monkeypatch.setenv(EVAR, "3,7,11")
+    vllm_config.parallel_config.data_parallel_size = 2
+    vllm_config.additional_config = {"tt": {"dp_device_ids": device_ids}}
+    with pytest.raises(ValueError, match=r"tt\.dp_device_ids"):
+        _resolve_standard_dp_visible_device_groups(vllm_config)
+    assert os.environ[EVAR] == "3,7,11"
+
+
+def test_explicit_singletons_reject_mpi_placement(
+    vllm_config: SimpleNamespace,
+) -> None:
+    vllm_config.parallel_config.data_parallel_size = 2
+    vllm_config.parallel_config.nnodes = 2
+    vllm_config.additional_config = {"tt": {"dp_device_ids": [0, 1]}}
+    with pytest.raises(ValueError, match="single-host standard DP"):
+        _resolve_standard_dp_visible_device_groups(vllm_config)
+
+
+def test_explicit_singletons_reject_inspector_port_overflow(
+    monkeypatch: pytest.MonkeyPatch,
+    vllm_config: SimpleNamespace,
+) -> None:
+    monkeypatch.delenv(EVAR, raising=False)
+    monkeypatch.setenv("TT_METAL_INSPECTOR_RPC_SERVER_ADDRESS", "localhost:65535")
+    vllm_config.parallel_config.data_parallel_size = 2
+    vllm_config.additional_config = {"tt": {"dp_device_ids": [0, 1]}}
+    with pytest.raises(ValueError, match="Inspector address"):
+        _resolve_standard_dp_visible_device_groups(vllm_config)
 
 
 @pytest.mark.parametrize(

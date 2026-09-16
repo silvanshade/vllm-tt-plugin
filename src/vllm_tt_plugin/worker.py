@@ -38,6 +38,7 @@ from vllm_tt_plugin.config import (
 from vllm_tt_plugin.logger import init_tt_logger
 from vllm_tt_plugin.model_runner import TTModelRunner
 from vllm_tt_plugin.platform import (
+    _STANDARD_DP_RUNTIME_ENVS_KEY,
     _STANDARD_DP_VISIBLE_GROUPS_KEY,
     _TT_TOKEN_TILE_SIZE,
     TTPlatform,
@@ -115,6 +116,11 @@ def _bind_visible_devices_env(vllm_config: VllmConfig) -> None:
     evar = TTPlatform.device_control_env_var
     inherited = os.environ.get(evar)
     os.environ[evar] = visible_devices
+    # Explicit singleton placement snapshots these in the launching process.
+    # Native Inspector rank offsets only apply to MPI, not vLLM's independent DP.
+    runtime_envs = vllm_config.additional_config.get(_STANDARD_DP_RUNTIME_ENVS_KEY)
+    if runtime_envs is not None:
+        os.environ.update(runtime_envs[parallel_config.data_parallel_rank_local])
 
     logger.info(
         "Bound %s=%s for local DP rank %s (inherited %r)",
