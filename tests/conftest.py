@@ -24,6 +24,7 @@ def reset_tt_platform_class_state():
     import vllm.v1.engine.async_llm as async_llm
     import vllm.v1.engine.core as engine_core
     import vllm.v1.engine.input_processor as input_processor
+    import vllm.v1.structured_output as structured_output
 
     from vllm_tt_plugin.platform import TTPlatform
 
@@ -50,8 +51,17 @@ def reset_tt_platform_class_state():
     saved_original_pause_scheduler = engine_core.__dict__.get(
         "_tt_original_pause_scheduler", unset
     )
+    saved_create_grammar = structured_output.StructuredOutputManager._create_grammar
+    saved_original_create_grammar = structured_output.__dict__.get(
+        "_tt_original_create_grammar", unset
+    )
 
     yield
+    structured_output.StructuredOutputManager._create_grammar = saved_create_grammar
+    if saved_original_create_grammar is unset:
+        structured_output.__dict__.pop("_tt_original_create_grammar", None)
+    else:
+        structured_output._tt_original_create_grammar = saved_original_create_grammar
 
     engine_core.EngineCore.reset_prefix_cache = saved_reset_prefix_cache
     engine_core.EngineCore.pause_scheduler = saved_pause_scheduler

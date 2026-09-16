@@ -25,6 +25,7 @@ from vllm_tt_plugin.config import (
     validate_tt_lane_config,
 )
 from vllm_tt_plugin.logger import init_tt_logger
+from vllm_tt_plugin.structured_output import install_tt_compact_json_patch
 from vllm_tt_plugin.utils.dp_discovery import (
     StandardDPAssignmentT,
     run_standard_dp_visible_device_group_discovery,
@@ -1517,16 +1518,7 @@ class TTPlatform(Platform):
             )
             model_config.max_logprobs = MAX_TOP_K
 
-        # Force the grammar backends to emit compact JSON. xgrammar and guidance
-        # allow arbitrary inter-field whitespace by default; under greedy decoding
-        # the model can pick a whitespace token as the argmax indefinitely,
-        # exhausting the token budget before it emits a property name and
-        # returning truncated, unparseable JSON. Masking whitespace out of the
-        # grammar makes that loop structurally impossible for any decoding
-        # strategy. Backend stays "auto" so schemas xgrammar cannot compile still
-        # fall back to guidance (which also honors this flag); outlines and
-        # lm-format-enforcer ignore it.
-        vllm_config.structured_outputs_config.disable_any_whitespace = True
+        install_tt_compact_json_patch()
 
         # Import and register models from tt-metal.
         #

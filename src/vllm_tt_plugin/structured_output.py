@@ -12,6 +12,9 @@ from vllm_tt_plugin.logger import init_tt_logger
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
+    from vllm.v1.request import Request
+    from vllm.v1.structured_output import StructuredOutputManager
+    from vllm.v1.structured_output.backend_types import StructuredOutputGrammar
     from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
 
@@ -19,6 +22,35 @@ logger = init_tt_logger(__name__)
 
 # Track missing request IDs we've already warned about, so each ID logs once.
 _warned_missing_request_ids: set[str] = set()
+
+
+def install_tt_compact_json_patch() -> None:
+    """Apply compact JSON to resolved backends without invalidating config.
+
+    # Specification
+    - provides: xgrammar and guidance disallow arbitrary JSON whitespace.
+    - preserves: configured backend selection, fallback and config revalidation.
+    - intension: installs once; defers policy until grammar compilation.
+    """
+    import vllm.v1.structured_output as structured_output
+
+    if hasattr(structured_output, "_tt_original_create_grammar"):
+        return
+    original = structured_output.StructuredOutputManager._create_grammar
+    structured_output._tt_original_create_grammar = original
+
+    def create_compact_grammar(
+        manager: StructuredOutputManager, request: Request
+    ) -> StructuredOutputGrammar:
+        backend = manager.backend
+        if isinstance(
+            backend,
+            (structured_output.XgrammarBackend, structured_output.GuidanceBackend),
+        ):
+            backend.disable_any_whitespace = True
+        return original(manager, request)
+
+    structured_output.StructuredOutputManager._create_grammar = create_compact_grammar
 
 
 def has_structured_outputs(

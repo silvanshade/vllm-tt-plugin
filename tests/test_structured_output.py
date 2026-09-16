@@ -1,9 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
 
-import torch
+import json
+from types import SimpleNamespace
 
-from vllm_tt_plugin.structured_output import reorder_grammar_bitmask_for_tt_batch
+import torch
+import xgrammar as xgr
+from vllm.v1.structured_output import StructuredOutputManager
+from vllm.v1.structured_output.backend_types import StructuredOutputOptions
+from vllm.v1.structured_output.backend_xgrammar import XgrammarBackend
+
+from vllm_tt_plugin.structured_output import (
+    install_tt_compact_json_patch,
+    reorder_grammar_bitmask_for_tt_batch,
+)
 
 
 def test_reorder_grammar_bitmask_uses_forward_row_order():
@@ -99,3 +109,39 @@ def test_reorder_grammar_bitmask_handles_forward_narrower_than_batch():
         reordered,
         torch.tensor([[-1, -1], [10, 11]], dtype=torch.int32),
     )
+
+
+def test_compact_json_rejects_whitespace_after_backend_selection() -> None:
+    """Automatic backend selection must retain the anti-whitespace-loop policy."""
+    vocab = ["[", " ", "1", "]", "<eos>"]
+    backend = object.__new__(XgrammarBackend)
+    backend.compiler = xgr.GrammarCompiler(
+        xgr.TokenizerInfo(vocab, xgr.VocabType.RAW, stop_token_ids=[4]),
+        max_threads=1,
+    )
+    backend.disable_any_whitespace = False
+    backend.num_speculative_tokens = 0
+    backend.vocab_size = len(vocab)
+    manager = object.__new__(StructuredOutputManager)
+    manager.backend = backend
+    request = SimpleNamespace(
+        request_id="compact-json",
+        sampling_params=None,
+        structured_output_request=SimpleNamespace(
+            structured_output_key=(
+                StructuredOutputOptions.JSON,
+                json.dumps(
+                    {
+                        "type": "array",
+                        "items": {"const": 1},
+                        "minItems": 1,
+                        "maxItems": 1,
+                    }
+                ),
+            )
+        ),
+    )
+    install_tt_compact_json_patch()
+    grammar = manager._create_grammar(request)
+    assert grammar.validate_tokens([0, 1]) == [0]
+    assert grammar.validate_tokens([0, 2, 3]) == [0, 2, 3]
