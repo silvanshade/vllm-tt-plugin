@@ -57,6 +57,7 @@ def _fake_runner(batch: InputBatch, request: CachedRequestState) -> SimpleNamesp
     """Creates a fake runner with the given batch and request, for testing purposes."""
     return SimpleNamespace(
         input_batch=batch,
+        native_mtp=None,
         requests={"r": request},
         _output_tokens_per_step=1,
         tt_per_lane_max_num_seqs=MAX_NUM_SEQS,

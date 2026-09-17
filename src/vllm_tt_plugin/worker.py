@@ -506,6 +506,10 @@ class TTWorker(WorkerBase):
         assert self.is_driver_worker, "There should only be one Worker for TT"
         return self.model_runner.sample_tokens(grammar_output)
 
+    def take_draft_token_ids(self):
+        controller = self.model_runner.native_mtp
+        return controller.take_draft_token_ids() if controller is not None else None
+
     def check_health(self) -> None:
         # Worker will always be healthy as long as it's running.
         return

@@ -26,6 +26,7 @@ def _runner(slots=SLOTS):
     """Fake runner: the state-slot map, the live-request set and the slot capacity."""
     return SimpleNamespace(
         tt_per_lane_max_num_seqs=slots,
+        native_mtp=None,
         _req_state_slot={},
         _pending_state_slot_settle=None,
         requests={},

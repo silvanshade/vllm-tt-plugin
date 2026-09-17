@@ -750,6 +750,32 @@ def _neutralize_model_owned_sampling(params) -> list[str]:
     return ignored
 
 
+def _install_native_mtp_sampling_validation() -> None:
+    """Admit serial target policy, unlike the upstream flattened GPU sampler."""
+    from vllm.config import SpeculativeConfig
+    from vllm.model_executor.model_loader.utils import get_model_architecture
+    from vllm.sampling_params import SamplingParams
+
+    original = SamplingParams._validate_spec_decode
+    if getattr(original, "_tt_native_mtp", False):
+        return
+
+    def validate_spec_decode(
+        params: SamplingParams, speculative_config: SpeculativeConfig | None
+    ) -> None:
+        if speculative_config is not None and speculative_config.method == "mtp":
+            model_class, _ = get_model_architecture(
+                speculative_config.target_model_config
+            )
+            capabilities = getattr(model_class, "model_capabilities", {})
+            if capabilities.get("supports_native_mtp", False):
+                return
+        original(params, speculative_config)
+
+    validate_spec_decode._tt_native_mtp = True
+    SamplingParams._validate_spec_decode = validate_spec_decode
+
+
 def _install_block_output_input_processor_patch() -> None:
     """Reject unsupported resumable requests and own block-output defaults.
 
@@ -1513,9 +1539,6 @@ class TTPlatform(Platform):
 
     @classmethod
     def _apply_check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
-        assert not vllm_config.speculative_config, (
-            "Speculative decoding is not yet supported for TT backend"
-        )
         assert (
             vllm_config.parallel_config.tensor_parallel_size == 1
             and vllm_config.parallel_config.pipeline_parallel_size == 1
@@ -1626,6 +1649,30 @@ class TTPlatform(Platform):
         model_capabilities: dict | None = getattr(
             model_class, "model_capabilities", None
         )
+
+        speculative = vllm_config.speculative_config
+        if speculative is not None:
+            if not model_capabilities or not model_capabilities.get(
+                "supports_native_mtp", False
+            ):
+                raise ValueError("This TT model does not support native MTP rounds")
+            if speculative.method != "mtp":
+                raise ValueError("TT native speculative decoding requires method='mtp'")
+            if not 1 <= speculative.num_speculative_tokens <= 31:
+                raise ValueError("TT native MTP supports 1..31 speculative tokens")
+            if tt_config.get("trace_mode", "all") == "none" or not tt_config.get(
+                "enable_model_warmup", True
+            ):
+                raise ValueError(
+                    "TT native MTP requires decode trace capture and model warmup"
+                )
+            if get_tt_data_parallel_size(vllm_config) != 1:
+                raise ValueError(
+                    "Native MTP uses independent process DP, not merged lane DP"
+                )
+            cls.sample_on_device_mode = None
+            vllm_config.scheduler_config.async_scheduling = False
+            _install_native_mtp_sampling_validation()
 
         # Rewrites scheduler_config; nothing between here and the closing
         # ``verify_max_model_len`` reads the fields it touches.

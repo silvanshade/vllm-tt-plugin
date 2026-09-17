@@ -64,6 +64,7 @@ from vllm_tt_plugin.model_input import (
     TTSamplingParams,
     slice_tt_sampling_params,
 )
+from vllm_tt_plugin.mtp import TTNativeMTPController
 from vllm_tt_plugin.platform import TTPlatform
 from vllm_tt_plugin.scheduler import get_tt_forced_reset_discard_counts
 from vllm_tt_plugin.structured_output import (
@@ -250,15 +251,21 @@ class TTModelRunner:
         # sampler state. Single-process modes also instantiate exactly one.
         self.host_sampler = Sampler()
 
-        # Host-side logits processors (min_p, logit_bias, min_tokens, plus any
-        # custom logits processors). Used by the host sampler when device
-        # sampling isn't supported for a given batch.
-        self._host_logitsprocs: LogitsProcessors = build_logitsprocs(
-            vllm_config=vllm_config,
-            device=torch.device("cpu"),
-            is_pin_memory=False,
-            is_pooling_model=False,
-            custom_logitsprocs=(self.model_config.logits_processors or ()),
+        self.native_mtp = (
+            TTNativeMTPController(self) if self.speculative_config is not None else None
+        )
+        # Native MTP owns serial policy per request, including final prefill.
+        # Ordinary decoding owns policy in the persistent batch instead.
+        self._host_logitsprocs: LogitsProcessors = (
+            LogitsProcessors()
+            if self.native_mtp is not None
+            else build_logitsprocs(
+                vllm_config=vllm_config,
+                device=torch.device("cpu"),
+                is_pin_memory=False,
+                is_pooling_model=False,
+                custom_logitsprocs=(self.model_config.logits_processors or ()),
+            )
         )
 
     def shutdown(self) -> None:
@@ -666,6 +673,8 @@ class TTModelRunner:
         preferred row is held (``_alloc_prefill_state_slots``).
         """
         slot = self._req_state_slot.get(req_id)
+        if self.native_mtp is not None:
+            self.native_mtp.release_request(req_id)
         release = getattr(getattr(self, "model", None), "release_request", None)
         if slot is not None and callable(release):
             release(slot)
@@ -1307,6 +1316,8 @@ class TTModelRunner:
             is_decode=not is_prompt,
             has_structured_outputs=has_structured,
         )
+        if self.native_mtp is not None:
+            perform_device_sampling = False
         if intermediate_prefill_mask is not None and intermediate_prefill_mask.any():
             # Device sampling advances device RNG state for every row it reads,
             # which an intermediate chunk must not do. Host sampling can hand
@@ -1694,6 +1705,11 @@ class TTModelRunner:
         if model_input is None:
             return EMPTY_MODEL_RUNNER_OUTPUT
 
+        if self.native_mtp is not None:
+            self._pending_samples.append(
+                self.native_mtp.submit(model_input, scheduler_output)
+            )
+            return None
         is_decode = model_input.prompt_lens is None
         if self.async_decode_scheduling and is_decode:
             steady_decode_fast_path = self.async_decode.can_use_steady_decode_fast_path(

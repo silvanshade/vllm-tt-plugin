@@ -22,6 +22,7 @@ here. Nothing TT-specific needs to touch vLLM core.
 |   +-- model_registry.py    # TT model architecture registration
 |   +-- worker.py            # TT worker implementation
 |   +-- model_runner.py      # TT model execution bridge
+|   +-- mtp.py               # Native captured-round speculative adapter
 |   +-- scheduler.py         # TT scheduling policy
 |   +-- lane_scheduler.py    # Single-process multi-lane (lane-DP) coordinator
 |   +-- launcher.py          # retained tt-run / MPI launcher (not hooked by vLLM 0.29.0)
@@ -384,6 +385,14 @@ For a deeper walk-through of the scheduling and execution model, read
 resident async decode safe are documented in
 [`docs/DECODE_RELOAD_CONTRACT.md`](docs/DECODE_RELOAD_CONTRACT.md).
 
+### Native MTP
+
+Models declaring `supports_native_mtp` accept `--speculative-config '{"method":"mtp","num_speculative_tokens":5}'`; the native Qwen3.6 bridge implements this capability. The admitted draft count is 1–31. Warmup and trace capture must remain enabled, and `tt.trace_region_size` must cover all count/slot captures in addition to KV memory. Trace requirements grow with both draft count and per-engine request capacity.
+
+Native MTP uses synchronous speculative scheduling. Independent multi-process DP ranks retain separate meshes, caches, request state and RNG; merged in-process TT lanes are rejected. Greedy rounds return compact token/count messages without downloading vocabulary logits or target hidden rows. Target policies requiring penalties, constraints, sampling or logprobs run at a bounded host target-policy boundary; recursive drafting remains device-resident. Seeded target decisions stop at the first rejected draft, so discarded rows consume no RNG.
+
+The adapter publishes `DraftTokenIds`, applies per-request processors and grammar masks, commits ragged output histories once, and releases policy/draft state on request retirement. Min-p and logit bias are admitted for this serial native target-policy path without relaxing vLLM's restrictions for other speculative implementations. Omit `--speculative-config` to keep ordinary decoding.
+
 ## Single-Process Galaxy Serving
 
 Galaxy text models served by the single-execute Galaxy generator
@@ -464,7 +473,7 @@ clear error before anything reaches the device:
 
 - Tensor parallel and pipeline parallel execution are provided by the models
   internal implementation, not exposed at the vLLM level.
-- Speculative decoding is not currently supported.
+- Speculative decoding requires the native MTP capability and supported configuration described [above](#native-mtp). Other speculative methods are rejected.
 - LoRA is not currently supported.
 - Chunked prefill is gated on the model's declared capability, not on a
   `model_type` allowlist. vLLM enables it by default; pass
