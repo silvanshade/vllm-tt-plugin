@@ -33,7 +33,7 @@ from vllm.v1.sample.logits_processor.builtin import (
 from vllm_tt_plugin.model_input import TTModelInput, slice_tt_sampling_params
 
 if TYPE_CHECKING:
-    from models.demos.blackhole.qwen36.tt.mtp_round import Qwen36MTPRound
+    from models.demos.qwen38.tt.mtp_round import Qwen38MTPRound
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 
     from vllm_tt_plugin.model_runner import TTModelRunner, _SyncForward
@@ -53,7 +53,7 @@ class TTNativeMTPController:
         self.drafts: dict[str, list[int]] = {}
 
     @property
-    def round(self) -> Qwen36MTPRound:
+    def round(self) -> Qwen38MTPRound:
         return self.runner.model.mtp_round
 
     def release_request(self, req_id: str) -> None:

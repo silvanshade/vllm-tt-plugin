@@ -387,7 +387,7 @@ resident async decode safe are documented in
 
 ### Native MTP
 
-Models declaring `supports_native_mtp` accept `--speculative-config '{"method":"mtp","num_speculative_tokens":5}'`; the native Qwen3.6 bridge implements this capability. The admitted draft count is 1–31. Warmup and trace capture must remain enabled, and `tt.trace_region_size` must cover all count/slot captures in addition to KV memory. Trace requirements grow with both draft count and per-engine request capacity.
+Models declaring `supports_native_mtp` accept `--speculative-config '{"method":"mtp","num_speculative_tokens":5}'`; the native Qwen3.8 bridge implements this capability. The admitted draft count is 1–31. Warmup and trace capture must remain enabled, and `tt.trace_region_size` must cover all count/slot captures in addition to KV memory. Trace requirements grow with both draft count and per-engine request capacity.
 
 Native MTP uses synchronous speculative scheduling. Independent multi-process DP ranks retain separate meshes, caches, request state and RNG; merged in-process TT lanes are rejected. Greedy rounds return compact token/count messages without downloading vocabulary logits or target hidden rows. Target policies requiring penalties, constraints, sampling or logprobs run at a bounded host target-policy boundary; recursive drafting remains device-resident. Seeded target decisions stop at the first rejected draft, so discarded rows consume no RNG.
 

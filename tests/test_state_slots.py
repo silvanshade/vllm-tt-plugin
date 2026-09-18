@@ -5,7 +5,7 @@
 A persistent-batch ROW is not stable for a request: ``_update_states`` evicts a
 running request the step does not schedule (every prefill step does) and re-adds it
 at whatever row is free, and ``condense`` moves rows down when a request finishes.
-Device state indexed by slot (Qwen3.6 GDN recurrent+conv, the per-slot seed RNG, the
+Device state indexed by slot (Qwen3.8 GDN recurrent+conv, the per-slot seed RNG, the
 decode trace's token/position buffers) does not follow, so
 ``_alloc_prefill_state_slots`` and ``_decode_state_slot_remap`` say where each
 request's state is, and ``_release_dead_state_slots`` says when a request stops

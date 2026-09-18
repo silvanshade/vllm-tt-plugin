@@ -65,8 +65,8 @@ TT_LANE_SCHEDULER_CLS = "vllm_tt_plugin.lane_scheduler.TTLaneCoordinator"
 # must agree on this hardware-fixed value.
 _TT_TOKEN_TILE_SIZE = 32
 # KV page width the TT model trees are built for. Every ``models/demos`` tree
-# pages at 64 (``qwen36_vllm._BLOCK_SIZE``, the Gemma4 and Qwen3.6 demos and
-# tests), the Qwen3.6 chunked prefill hardcodes it (``model.py`` page-table
+# pages at 64 (``qwen38_vllm._BLOCK_SIZE``, the Gemma4 and Qwen3.8 demos and
+# tests), the Qwen3.8 chunked prefill hardcodes it (``model.py`` page-table
 # slicing), and ``docs/diffusion-gemma.md`` already tells operators to pass it;
 # ``tt_transformers`` reads the width from the cache and accepts any value.
 _TT_DEFAULT_KV_BLOCK_SIZE = 64
@@ -1144,15 +1144,13 @@ def register_tt_models(register_test_models=False) -> None:
     _register_model_if_missing(ModelRegistry, "TTQwen3ForCausalLM", path_qwen3_text)
 
     # Qwen3.5 - Text
-    qwen35_text_version = os.getenv("TT_QWEN35_TEXT_VER", "qwen36_blackhole")
-    if qwen35_text_version == "qwen36_blackhole":
-        path_qwen35_text = (
-            "models.demos.blackhole.qwen36.tt.qwen36_vllm:Qwen36ForCausalLM"
-        )
+    qwen35_text_version = os.getenv("TT_QWEN35_TEXT_VER", "qwen38")
+    if qwen35_text_version == "qwen38":
+        path_qwen35_text = "models.demos.qwen38.tt.qwen38_vllm:Qwen38ForCausalLM"
     else:
         raise ValueError(
             f"Unsupported TT Qwen3.5 version: {qwen35_text_version}, "
-            "pick one of [qwen36_blackhole]"
+            "pick one of [qwen38]"
         )
 
     _register_model_if_missing(
@@ -1425,7 +1423,7 @@ class TTPlatform(Platform):
 
         Core picks ``block_size`` from the attention backend's preference and
         returns before that when the platform has no backend, so TT kept core's
-        16-token default. The Qwen3.6 tree slices its page table at 64 on the
+        16-token default. The Qwen3.8 tree slices its page table at 64 on the
         chunked prefill path whatever the cache holds, so a 16-token pool
         wedges the device on the first prompt above one chunk, with no error.
         ``--block-size`` still wins when the operator sets it.
