@@ -71,6 +71,7 @@ from vllm_tt_plugin.structured_output import (
     has_structured_outputs,
     reorder_grammar_bitmask_for_tt_batch,
 )
+from vllm_tt_plugin.thinking import install_thinking_budget
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -267,6 +268,11 @@ class TTModelRunner:
                 custom_logitsprocs=(self.model_config.logits_processors or ()),
             )
         )
+        if self.native_mtp is None:
+            # Thinking budgets enforce themselves at sample time, so they ride
+            # with the batch's own policy here and with the per-request policy
+            # the MTP controller builds (``mtp.TTNativeMTPController._policy``).
+            install_thinking_budget(self._host_logitsprocs, vllm_config)
 
     def shutdown(self) -> None:
         """Deterministically release optional model-lifetime captures.

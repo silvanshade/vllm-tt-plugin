@@ -31,6 +31,10 @@ from vllm.v1.sample.logits_processor.builtin import (
 )
 
 from vllm_tt_plugin.model_input import TTModelInput, slice_tt_sampling_params
+from vllm_tt_plugin.thinking import (
+    ThinkingBudgetLogitsProcessor,
+    install_thinking_budget,
+)
 
 if TYPE_CHECKING:
     from models.demos.qwen38.tt.mtp_round import Qwen38MTPRound
@@ -92,6 +96,9 @@ class TTNativeMTPController:
                 is_pooling_model=False,
                 custom_logitsprocs=runner.model_config.logits_processors or (),
             )
+            # One budget tracker per request, matching this per-request policy:
+            # the batch row it sees is the single row ``_row_input`` samples.
+            install_thinking_budget(processors, self.policy_config)
             update = BatchUpdate(
                 batch_size=1,
                 removed=[],
@@ -195,6 +202,7 @@ class TTNativeMTPController:
             MinTokensLogitsProcessor,
             LogitBiasLogitsProcessor,
             MinPLogitsProcessor,
+            ThinkingBudgetLogitsProcessor,
         )
         return (
             params.temperature == 0
@@ -206,6 +214,9 @@ class TTNativeMTPController:
             and not params.allowed_token_ids
             and not params.bad_words
             and not params.extra_args
+            # A budget forces reasoning-end tokens, which the device's greedy
+            # egress cannot do, so a budgeted round takes the host policy.
+            and params.thinking_token_budget is None
             and req_id not in masks
             and model_input.max_num_logprobs[0] is None
             and all(type(p) in known_processors for p in self._policy(req_id).all)

@@ -32,6 +32,7 @@ from vllm_tt_plugin.structured_output import (
     has_structured_outputs,
     reorder_grammar_bitmask_for_tt_batch,
 )
+from vllm_tt_plugin.thinking import ThinkingBudgetLogitsProcessor
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -176,6 +177,13 @@ class SamplingInputBatch:
             if isinstance(proc, LogitBiasLogitsProcessor) and proc.biases:
                 return True
             if isinstance(proc, MinTokensLogitsProcessor) and proc.min_toks:
+                return True
+            # A tracked thinking budget forces reasoning-end tokens, which the
+            # device sampler cannot do.
+            if (
+                isinstance(proc, ThinkingBudgetLogitsProcessor)
+                and proc.has_tracked_rows()
+            ):
                 return True
         return False
 
