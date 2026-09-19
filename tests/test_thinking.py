@@ -4,10 +4,15 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.logits_processor.interface import BatchUpdate, MoveDirectionality
 
-from vllm_tt_plugin.input_batch import SamplingInputBatch
+from vllm_tt_plugin.input_batch import (
+    CachedRequestState,
+    InputBatch,
+    SamplingInputBatch,
+)
 from vllm_tt_plugin.thinking import (
     NINFER_POST_THINKING,
     PostThinkingSwitch,
@@ -271,3 +276,43 @@ def test_post_thinking_switch_absent_without_a_reasoning_config():
 def test_post_thinking_switch_rejects_an_unusable_deployment_setting():
     with pytest.raises(ValueError, match="post_thinking"):
         PostThinkingSwitch.from_config(_vllm_config(tt_cfg={"post_thinking": "yes"}))
+
+
+def test_post_thinking_switch_reaches_the_persistent_batch_rows():
+    """The wiring, not the switch: ``refresh_logitsprocs`` must sync the batch
+    update into the switch and then write the row, or a request keeps its
+    reasoning-phase sampling through the answer."""
+    switch = PostThinkingSwitch.from_config(_vllm_config())
+    batch = InputBatch(
+        max_num_reqs=2,
+        max_model_len=256,
+        max_num_batched_tokens=256,
+        vocab_size=VOCAB,
+        block_sizes=[16],
+        kernel_block_sizes=[16],
+        post_thinking=switch,
+    )
+    output: list[int] = [7]
+    batch.add_request(
+        CachedRequestState(
+            req_id="r0",
+            prompt_token_ids=[5, THINK_OPEN],
+            mm_features=None,
+            sampling_params=SamplingParams(temperature=1.0, top_p=0.95, max_tokens=64),
+            generator=None,
+            block_ids=([0],),
+            num_computed_tokens=2,
+            output_token_ids=output,
+        )
+    )
+
+    batch.refresh_logitsprocs()
+    assert batch.sampling.temperature[0].item() == pytest.approx(1.0)
+
+    output.append(THINK_CLOSE)
+    batch.refresh_logitsprocs()
+
+    assert batch.sampling.temperature[0].item() == pytest.approx(
+        NINFER_POST_THINKING.temperature
+    )
+    assert int(batch.sampling.top_k[0].item()) == NINFER_POST_THINKING.top_k
