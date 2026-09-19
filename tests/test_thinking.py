@@ -222,7 +222,7 @@ def test_post_thinking_request_override_wins_over_the_served_preset():
     output: list[int] = [7, THINK_CLOSE]
     _switch_with_row(
         switch,
-        _params(extra_args={"post_thinking": {"temperature": 0.5}}),
+        _params(extra_args={"post_thinking_temperature": 0.5}),
         [THINK_OPEN],
         output,
     )
@@ -232,13 +232,15 @@ def test_post_thinking_request_override_wins_over_the_served_preset():
     assert sampling.top_p[0].item() == pytest.approx(NINFER_POST_THINKING.top_p)
 
 
-def test_post_thinking_request_can_opt_out():
+@pytest.mark.parametrize("sent", [False, 0, "false", "off"])
+def test_post_thinking_request_can_opt_out(sent):
+    # vllm_xargs carries scalars only, and a JSON false arrives as 0.
     switch = PostThinkingSwitch.from_config(_vllm_config())
     sampling = SamplingInputBatch(2)
     sampling.temperature[0] = 1.0
     output: list[int] = [7, THINK_CLOSE]
     _switch_with_row(
-        switch, _params(extra_args={"post_thinking": False}), [THINK_OPEN], output
+        switch, _params(extra_args={"post_thinking": sent}), [THINK_OPEN], output
     )
 
     assert switch.apply(sampling) == []

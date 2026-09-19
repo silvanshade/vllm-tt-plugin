@@ -299,33 +299,39 @@ NINFER_POST_THINKING = PostThinkingPreset(
 def _request_preset(
     params: Any, default: PostThinkingPreset
 ) -> PostThinkingPreset | None:
-    """The preset for one request: its own ``post_thinking`` wins.
+    """The preset for one request: its own ``post_thinking`` keys win.
 
-    ``vllm_xargs: {"post_thinking": false}`` opts a request out;
-    ``vllm_xargs: {"post_thinking": {"temperature": 0.4}}`` overrides fields of
-    the served preset.
+    ``vllm_xargs`` carries scalars only (``str | int | float``; an object is
+    rejected at the API boundary and a JSON ``false`` arrives as ``0``), so
+    the request-side controls are flat:
+
+    * ``post_thinking: false`` / ``0`` / ``"off"`` opts the request out;
+    * ``post_thinking_temperature``, ``post_thinking_top_k``,
+      ``post_thinking_top_p``, ``post_thinking_presence_penalty`` override
+      single fields of the served preset.
     """
     extra_args = getattr(params, "extra_args", None) or {}
-    if "post_thinking" not in extra_args:
+    if not extra_args:
         return default
-    override = extra_args["post_thinking"]
-    if override is None or override is False:
+    enabled = extra_args.get("post_thinking", True)
+    if enabled is None or enabled is False or enabled in (0, "0", "false", "off"):
         return None
-    if isinstance(override, Mapping):
-        try:
-            return default.merged(override)
-        except (TypeError, ValueError):
-            logger.warning(
-                "Ignoring unusable post_thinking override %s; serving the "
-                "deployment preset instead",
-                override,
-            )
-            return default
-    logger.warning(
-        "Ignoring post_thinking of type %s; expected an object or false",
-        type(override).__name__,
-    )
-    return default
+    override = {
+        field: extra_args[f"post_thinking_{field}"]
+        for field in PostThinkingPreset._FIELDS
+        if f"post_thinking_{field}" in extra_args
+    }
+    if not override:
+        return default
+    try:
+        return default.merged(override)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Ignoring unusable post_thinking override %s; serving the "
+            "deployment preset instead",
+            override,
+        )
+        return default
 
 
 class PostThinkingSwitch:
