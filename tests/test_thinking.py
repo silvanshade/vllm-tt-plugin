@@ -7,7 +7,10 @@ import torch
 from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.logits_processor.interface import BatchUpdate, MoveDirectionality
 
+from vllm_tt_plugin.input_batch import SamplingInputBatch
 from vllm_tt_plugin.thinking import (
+    NINFER_POST_THINKING,
+    PostThinkingSwitch,
     ThinkingBudgetLogitsProcessor,
     install_thinking_budget,
 )
@@ -36,7 +39,10 @@ def _vllm_config(*, reasoning: bool = True, tt_cfg: dict | None = None):
 
 
 def _params(**kwargs):
-    fields = {"thinking_token_budget": None, "extra_args": None}
+    fields = {
+        "thinking_token_budget": None,
+        "extra_args": None,
+    }
     fields.update(kwargs)
     return SimpleNamespace(**fields)
 
@@ -84,8 +90,8 @@ def test_budget_forces_the_close_once_the_section_spends_it():
 
 
 def test_budget_counts_reasoning_the_prompt_already_opened_from_the_output():
-    # The chat template opens ``<think>`` in the generation prompt, so the
-    # count starts at the first generated token, not at a generated opener.
+    # The chat template opens ``<think>`` in the prompt, so the count starts at
+    # the first generated token, not at a generated opener.
     output: list[int] = [7]
     processor = _budget_processor(1, [5, THINK_OPEN], output)
 
@@ -165,3 +171,101 @@ def test_install_thinking_budget_is_skipped_without_a_reasoning_config():
 
     assert install_thinking_budget(logitsprocs, _vllm_config(reasoning=False)) is None
     assert list(logitsprocs.all) == []
+
+
+def _switch_with_row(switch, params, prompt, output, index=0):
+    switch.sync(_added(index, params, prompt, output))
+
+
+def test_post_thinking_switch_rewrites_the_row_when_reasoning_closes():
+    switch = PostThinkingSwitch.from_config(_vllm_config())
+    sampling = SamplingInputBatch(2)
+    sampling.temperature[0] = 1.0
+    sampling.top_p[0] = 0.95
+    sampling.top_k[0] = 20
+    output: list[int] = [7]
+    _switch_with_row(switch, _params(), [THINK_OPEN], output)
+
+    assert switch.apply(sampling) == []
+    assert sampling.temperature[0].item() == pytest.approx(1.0)
+
+    output.append(THINK_CLOSE)
+
+    assert switch.apply(sampling) == [0]
+    assert switch.has_switched(0)
+    assert sampling.temperature[0].item() == pytest.approx(
+        NINFER_POST_THINKING.temperature
+    )
+    assert sampling.top_p[0].item() == pytest.approx(NINFER_POST_THINKING.top_p)
+    assert int(sampling.top_k[0].item()) == NINFER_POST_THINKING.top_k
+    # A second step does not re-apply, so a later request field stays put.
+    sampling.temperature[0] = 0.9
+    assert switch.apply(sampling) == []
+    assert sampling.temperature[0].item() == pytest.approx(0.9)
+
+
+def test_post_thinking_switch_leaves_a_non_reasoning_turn_alone():
+    switch = PostThinkingSwitch.from_config(_vllm_config())
+    sampling = SamplingInputBatch(2)
+    sampling.temperature[0] = 0.7
+    output: list[int] = [7, 7, THINK_CLOSE]
+    # No opener anywhere, so nothing was ever a reasoning section to close.
+    _switch_with_row(switch, _params(), [5], output)
+
+    assert switch.apply(sampling) == []
+    assert sampling.temperature[0].item() == pytest.approx(0.7)
+
+
+def test_post_thinking_request_override_wins_over_the_served_preset():
+    switch = PostThinkingSwitch.from_config(_vllm_config())
+    sampling = SamplingInputBatch(2)
+    output: list[int] = [7, THINK_CLOSE]
+    _switch_with_row(
+        switch,
+        _params(extra_args={"post_thinking": {"temperature": 0.5}}),
+        [THINK_OPEN],
+        output,
+    )
+
+    assert switch.apply(sampling) == [0]
+    assert sampling.temperature[0].item() == pytest.approx(0.5)
+    assert sampling.top_p[0].item() == pytest.approx(NINFER_POST_THINKING.top_p)
+
+
+def test_post_thinking_request_can_opt_out():
+    switch = PostThinkingSwitch.from_config(_vllm_config())
+    sampling = SamplingInputBatch(2)
+    sampling.temperature[0] = 1.0
+    output: list[int] = [7, THINK_CLOSE]
+    _switch_with_row(
+        switch, _params(extra_args={"post_thinking": False}), [THINK_OPEN], output
+    )
+
+    assert switch.apply(sampling) == []
+    assert not switch.has_switched(0)
+    assert sampling.temperature[0].item() == pytest.approx(1.0)
+
+
+def test_post_thinking_switch_honours_the_deployment_preset():
+    switch = PostThinkingSwitch.from_config(
+        _vllm_config(tt_cfg={"post_thinking": {"temperature": 0.3, "top_p": 0.8}})
+    )
+
+    assert switch.preset.temperature == pytest.approx(0.3)
+    assert switch.preset.top_p == pytest.approx(0.8)
+    assert switch.preset.top_k == NINFER_POST_THINKING.top_k
+
+
+def test_post_thinking_switch_can_be_turned_off_for_the_deployment():
+    config = _vllm_config(tt_cfg={"post_thinking": False})
+
+    assert PostThinkingSwitch.from_config(config) is None
+
+
+def test_post_thinking_switch_absent_without_a_reasoning_config():
+    assert PostThinkingSwitch.from_config(_vllm_config(reasoning=False)) is None
+
+
+def test_post_thinking_switch_rejects_an_unusable_deployment_setting():
+    with pytest.raises(ValueError, match="post_thinking"):
+        PostThinkingSwitch.from_config(_vllm_config(tt_cfg={"post_thinking": "yes"}))

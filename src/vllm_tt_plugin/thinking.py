@@ -7,31 +7,41 @@ vLLM enforces a per-request thinking budget at sample time through
 ``SamplingMetadata.thinking_budget_state_holder``, which the GPU input batch
 constructs. The TT plugin owns its own persistent batch and its own
 ``SamplingMetadata`` build, so that holder is never constructed and the wire
-field ``thinking_token_budget`` is accepted and then ignored.
+field ``thinking_token_budget`` is accepted and then ignored. The engine has no
+post-thinking sampler switch at all.
 
-:class:`ThinkingBudgetLogitsProcessor` restores it over one incremental scan of
-a request's output tokens (:class:`ReasoningPhase`): it forces the
-reasoning-end tokens once a request has spent its budget. It is an ordinary
-logits processor, so it reaches both host-sampling paths the plugin has -- the
-persistent batch's merged metadata, and the per-request policy the native MTP
-round builds.
+Both controls live here, over one incremental scan of a request's output
+tokens (:class:`ReasoningPhase`):
+
+* :class:`ThinkingBudgetLogitsProcessor` forces the reasoning-end tokens once a
+  request has spent its budget. It is an ordinary logits processor, so it
+  reaches both host-sampling paths the plugin has: the persistent batch's
+  merged metadata, and the per-request policy the native MTP round builds.
+* :class:`PostThinkingSwitch` rewrites a row's sampling parameters to the
+  post-thinking preset once the model closes its reasoning block, the way the
+  ninfer engine applies its post-reasoning preset mid-generation.
 
 Both are keyed on the reasoning token ids the configured reasoning parser
 derives (``--reasoning-parser qwen3`` gives ``<think>`` / ``</think>``); with no
-reasoning config the control is not installed and the field stays inert.
+reasoning config neither control is installed.
 """
 
 from collections import deque
-from collections.abc import Sequence
-from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.v1.sample.logits_processor import LogitsProcessor, LogitsProcessors
 from vllm.v1.sample.logits_processor.interface import BatchUpdate, MoveDirectionality
 
+from vllm_tt_plugin.config import get_tt_config
+from vllm_tt_plugin.logger import init_tt_logger
+
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+
+logger = init_tt_logger(__name__)
 
 # How far a phase scan can be rewound without rescanning from the start. The
 # native MTP round appends its accepted tokens to the request's live output
@@ -252,6 +262,169 @@ class ThinkingBudgetLogitsProcessor(LogitsProcessor):
             logits[index].fill_(float("-inf"))
             logits[index, token] = 0.0
         return logits
+
+
+@dataclass(frozen=True)
+class PostThinkingPreset:
+    """Sampling applied once a request closes its reasoning block.
+
+    ``min_p`` is absent: the reference preset sets it to zero, which is the
+    default, and the TT device sampler carries no ``min_p`` field at all.
+    """
+
+    temperature: float
+    top_k: int
+    top_p: float
+    presence_penalty: float
+
+    _FIELDS = ("temperature", "top_k", "top_p", "presence_penalty")
+
+    def merged(self, override: Mapping[str, Any]) -> "PostThinkingPreset":
+        """This preset with the recognized keys of ``override`` replaced."""
+        changes = {
+            field: type(getattr(self, field))(override[field])
+            for field in self._FIELDS
+            if field in override
+        }
+        return replace(self, **changes)
+
+
+# The ninfer engine's post-reasoning preset for this architecture: the answer
+# phase is sampled far tighter than the reasoning phase.
+NINFER_POST_THINKING = PostThinkingPreset(
+    temperature=0.2, top_k=20, top_p=0.95, presence_penalty=0.0
+)
+
+
+def _request_preset(
+    params: Any, default: PostThinkingPreset
+) -> PostThinkingPreset | None:
+    """The preset for one request: its own ``post_thinking`` wins.
+
+    ``vllm_xargs: {"post_thinking": false}`` opts a request out;
+    ``vllm_xargs: {"post_thinking": {"temperature": 0.4}}`` overrides fields of
+    the served preset.
+    """
+    extra_args = getattr(params, "extra_args", None) or {}
+    if "post_thinking" not in extra_args:
+        return default
+    override = extra_args["post_thinking"]
+    if override is None or override is False:
+        return None
+    if isinstance(override, Mapping):
+        try:
+            return default.merged(override)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Ignoring unusable post_thinking override %s; serving the "
+                "deployment preset instead",
+                override,
+            )
+            return default
+    logger.warning(
+        "Ignoring post_thinking of type %s; expected an object or false",
+        type(override).__name__,
+    )
+    return default
+
+
+class PostThinkingSwitch:
+    """Re-sample the answer phase at the post-thinking preset.
+
+    The switch writes the preset into the persistent batch's per-row sampling
+    tensors, so every sampling path reads it with no further plumbing: the
+    merged host metadata, the per-DP host metadata, the device sampler's
+    per-row parameters, and the row views the MTP round slices out of them.
+
+    A row switches once, at the first step after its reasoning block closes.
+    Under speculation the close can land mid-round, so the answer phase starts
+    at the preset at most one round late.
+    """
+
+    def __init__(self, tokens: ReasoningTokens, preset: PostThinkingPreset) -> None:
+        self._tokens = tokens
+        self._preset = preset
+        self._rows: dict[int, tuple[ReasoningPhase, PostThinkingPreset | None]] = {}
+        self._switched: set[int] = set()
+
+    @classmethod
+    def from_config(cls, vllm_config: "VllmConfig") -> "PostThinkingSwitch | None":
+        """Build the switch this deployment asks for, or ``None``.
+
+        ``--additional-config '{"tt": {"post_thinking": false}}'`` disables it;
+        an object overrides fields of the reference preset.
+        """
+        tokens = ReasoningTokens.from_config(vllm_config)
+        if tokens is None:
+            return None
+        setting = get_tt_config(vllm_config).get("post_thinking", True)
+        if setting is False or setting is None:
+            return None
+        preset = NINFER_POST_THINKING
+        if isinstance(setting, Mapping):
+            preset = preset.merged(setting)
+        elif setting is not True:
+            raise ValueError(
+                "additional_config['tt']['post_thinking'] must be an object or "
+                f"a boolean, got {type(setting).__name__}"
+            )
+        return cls(tokens, preset)
+
+    @property
+    def preset(self) -> PostThinkingPreset:
+        return self._preset
+
+    def sync(self, batch_update: BatchUpdate | None) -> None:
+        if batch_update is None:
+            return
+        for index in batch_update.removed:
+            self._drop(index)
+        for index, params, prompt_token_ids, output_token_ids in batch_update.added:
+            self._drop(index)
+            self._rows[index] = (
+                ReasoningPhase(self._tokens, prompt_token_ids, output_token_ids),
+                _request_preset(params, self._preset),
+            )
+        for first, second, direction in batch_update.moved:
+            moved = self._rows.pop(first, None)
+            displaced = self._rows.pop(second, None)
+            was_switched = first in self._switched
+            displaced_switched = second in self._switched
+            self._switched.discard(first)
+            self._switched.discard(second)
+            if moved is not None:
+                self._rows[second] = moved
+                if was_switched:
+                    self._switched.add(second)
+            if direction is MoveDirectionality.SWAP and displaced is not None:
+                self._rows[first] = displaced
+                if displaced_switched:
+                    self._switched.add(first)
+
+    def _drop(self, index: int) -> None:
+        self._rows.pop(index, None)
+        self._switched.discard(index)
+
+    def apply(self, sampling: Any) -> list[int]:
+        """Switch every row whose reasoning closed; return those rows."""
+        switched: list[int] = []
+        for index, (phase, preset) in self._rows.items():
+            if preset is None or index in self._switched:
+                continue
+            phase.advance()
+            if not phase.closed:
+                continue
+            self._switched.add(index)
+            sampling.temperature[index] = preset.temperature
+            sampling.top_p[index] = preset.top_p
+            sampling.top_k[index] = preset.top_k
+            sampling.presence_penalty[index] = preset.presence_penalty
+            switched.append(index)
+        return switched
+
+    def has_switched(self, index: int) -> bool:
+        """Whether this row is already sampling the answer phase."""
+        return index in self._switched
 
 
 def install_thinking_budget(

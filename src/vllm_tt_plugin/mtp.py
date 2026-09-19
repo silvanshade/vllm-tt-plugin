@@ -214,13 +214,21 @@ class TTNativeMTPController:
             and not params.allowed_token_ids
             and not params.bad_words
             and not params.extra_args
-            # A budget forces reasoning-end tokens, which the device's greedy
-            # egress cannot do, so a budgeted round takes the host policy.
+            # A budget forces reasoning-end tokens and the post-thinking
+            # switch re-samples the answer phase; the device's greedy egress
+            # can do neither, so those rounds take the host policy.
             and params.thinking_token_budget is None
+            and not self._post_thinking_switched(req_id)
             and req_id not in masks
             and model_input.max_num_logprobs[0] is None
             and all(type(p) in known_processors for p in self._policy(req_id).all)
         )
+
+    def _post_thinking_switched(self, req_id: str) -> bool:
+        switch = self.runner.input_batch.post_thinking
+        if switch is None:
+            return False
+        return switch.has_switched(self.runner.input_batch.req_id_to_index[req_id])
 
     def _budget(self, req_id: str) -> int:
         request = self.runner.requests[req_id]

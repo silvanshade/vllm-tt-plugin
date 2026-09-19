@@ -71,7 +71,10 @@ from vllm_tt_plugin.structured_output import (
     has_structured_outputs,
     reorder_grammar_bitmask_for_tt_batch,
 )
-from vllm_tt_plugin.thinking import install_thinking_budget
+from vllm_tt_plugin.thinking import (
+    PostThinkingSwitch,
+    install_thinking_budget,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -273,6 +276,7 @@ class TTModelRunner:
             # with the batch's own policy here and with the per-request policy
             # the MTP controller builds (``mtp.TTNativeMTPController._policy``).
             install_thinking_budget(self._host_logitsprocs, vllm_config)
+        self._post_thinking = PostThinkingSwitch.from_config(vllm_config)
 
     def shutdown(self) -> None:
         """Deterministically release optional model-lifetime captures.
@@ -412,6 +416,7 @@ class TTModelRunner:
                 logitsprocs=self._host_logitsprocs,
                 disable_logprobs=self._is_block_output_model,
                 output_tokens_per_step=self._output_tokens_per_step,
+                post_thinking=self._post_thinking,
             )
         else:
             self.input_batch = InputBatch(
@@ -424,6 +429,7 @@ class TTModelRunner:
                 logitsprocs=self._host_logitsprocs,
                 disable_logprobs=self._is_block_output_model,
                 output_tokens_per_step=self._output_tokens_per_step,
+                post_thinking=self._post_thinking,
             )
 
         # The block tables in the persistent input batch have

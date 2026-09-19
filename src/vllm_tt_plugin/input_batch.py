@@ -32,7 +32,10 @@ from vllm_tt_plugin.structured_output import (
     has_structured_outputs,
     reorder_grammar_bitmask_for_tt_batch,
 )
-from vllm_tt_plugin.thinking import ThinkingBudgetLogitsProcessor
+from vllm_tt_plugin.thinking import (
+    PostThinkingSwitch,
+    ThinkingBudgetLogitsProcessor,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -219,12 +222,16 @@ class InputBatch:
         logitsprocs: LogitsProcessors | None = None,
         disable_logprobs: bool = False,
         output_tokens_per_step: int = 1,
+        post_thinking: PostThinkingSwitch | None = None,
     ):
         self.max_num_reqs = max_num_reqs
         self.max_model_len = max_model_len
         self.vocab_size = vocab_size
         self.disable_logprobs = disable_logprobs
         self.output_tokens_per_step = output_tokens_per_step
+        # Switches a row to the post-thinking preset when its reasoning closes;
+        # None when the deployment has no reasoning parser or opted out.
+        self.post_thinking = post_thinking
 
         self._req_ids: list[str | None] = []
         self.req_id_to_index: dict[str, int] = {}
@@ -607,14 +614,18 @@ class InputBatch:
         return len(self.sampling.has_allowed_token_ids) == 0
 
     def refresh_logitsprocs(self) -> None:
-        """Update logits processors with batch state changes."""
+        """Update logits processors and reasoning phase with batch changes."""
 
         # For non-pooling models - generate and apply logitsprocs update;
         # reset batch update tracking.
         # Update sampling metadata if batch state is changed.
         batch_update = self.sampling.batch_update_builder.get_and_reset(self.num_reqs)
+        if self.post_thinking is not None:
+            self.post_thinking.sync(batch_update)
         for logit_proc in self.sampling.logitsprocs.all:
             logit_proc.update_state(batch_update)
+        if self.post_thinking is not None:
+            self.post_thinking.apply(self.sampling)
 
     def make_prompt_token_ids_tensor(
         self, req_indices: list[int] | None = None
@@ -778,6 +789,7 @@ class TTLaneInputBatch(InputBatch):
         logitsprocs: LogitsProcessors | None = None,
         disable_logprobs: bool = False,
         output_tokens_per_step: int = 1,
+        post_thinking: PostThinkingSwitch | None = None,
     ):
         if num_lanes < 1 or per_lane < 1:
             raise ValueError(
@@ -796,6 +808,7 @@ class TTLaneInputBatch(InputBatch):
             logitsprocs=logitsprocs,
             disable_logprobs=disable_logprobs,
             output_tokens_per_step=output_tokens_per_step,
+            post_thinking=post_thinking,
         )
         # Rows are a fixed slot grid (lane-chunked), not a front-packed list:
         # pre-size so a request can occupy any slot in its lane's chunk, with
@@ -1001,8 +1014,12 @@ class TTLaneInputBatch(InputBatch):
         batch_update = self.sampling.batch_update_builder.get_and_reset(
             self.max_num_reqs
         )
+        if self.post_thinking is not None:
+            self.post_thinking.sync(batch_update)
         for logit_proc in self.sampling.logitsprocs.all:
             logit_proc.update_state(batch_update)
+        if self.post_thinking is not None:
+            self.post_thinking.apply(self.sampling)
 
     def build_merged_sampling_metadata(
         self,
